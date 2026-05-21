@@ -1,0 +1,11 @@
+*.gguf
+*.bin
+*.safetensors
+build/
+build-android/
+.venv/
+__pycache__/
+*.so
+*.exe
+*.apk
+.DS_Store
