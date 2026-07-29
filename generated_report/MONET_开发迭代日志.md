@@ -29,8 +29,9 @@
   - 既有完整 runtime 缺口未因本轮校验代码而关闭。
 - 待真实设备验证事项：Android 构建、模型加载、命令行/App 正确性、Prefill/Decode、内存、功耗和温升均未执行。
 - 代码提交：[`c2769bc`](https://github.com/jlsbz/MONET-llama.cpp/commit/c2769bc)
-- 文档提交：[待本轮文档提交完成后记录]
-- Pull Request：[待创建 Draft Pull Request 后回填]
+- 文档提交：[`49b03df`](https://github.com/jlsbz/MONET-llama.cpp/commit/49b03df)
+- GitHub 同步：`codex/monet-completion` 已推送至 `origin`。
+- Pull Request：未创建。GitHub App 创建动作返回 403；本机未安装 `gh`；应用内浏览器没有 GitHub 登录态。可由有权限的登录会话打开 [main...codex/monet-completion compare 页面](https://github.com/jlsbz/MONET-llama.cpp/compare/main...codex/monet-completion?expand=1) 创建 Draft PR。禁止使用强推或在文件中保存访问令牌。
 - 下一轮建议：
   1. 提供最小真实 `.pt` 参数包和可复现 HF 模型，闭环 `.pt → GGUF → reader`；
   2. 在固定 GGUF 上补充主机端 loader 构建/加载回归和日志；
