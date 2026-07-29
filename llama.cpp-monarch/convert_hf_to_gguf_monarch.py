@@ -8,9 +8,6 @@ import logging
 import os
 import sys
 from pathlib import Path
-import re
-import json
-from types import MethodType
 import numpy as np
 
 import torch
@@ -28,6 +25,11 @@ from conversion import (
     print_registered_models,
     _mistral_common_installed,
     _mistral_import_error_msg,
+)
+from monarch_tensor_validation import (
+    extract_monarch_fields,
+    hf_layer_to_gguf_base,
+    validate_monarch_arrays,
 )
 
 
@@ -65,59 +67,40 @@ def list_monarch_pt_files(monarch_dir: Path) -> list[Path]:
     return sorted(files)
 
 
-def load_monarch_obj(pt_path: Path) -> dict:
-    obj = torch.load(pt_path, map_location="cpu")
-
-    if "layer_name" not in obj and "target_module_name" not in obj:
-        raise KeyError(
-            f"{pt_path} does not contain 'layer_name' or 'target_module_name'"
-        )
-
-    if "layer_name" not in obj:
-        obj["layer_name"] = obj["target_module_name"]
-
-    for k in ["L", "R", "perm"]:
-        if k not in obj:
-            raise KeyError(f"{pt_path} does not contain required key '{k}'")
-
-    return obj
-
-
-def hf_layer_to_gguf_base(layer_name: str) -> str | None:
-    """
-    Map HF LLaMA layer name to GGUF base tensor name.
-
-    HF:
-        model.layers.0.self_attn.q_proj
-        model.layers.0.self_attn.k_proj
-        model.layers.0.self_attn.v_proj
-        model.layers.0.self_attn.o_proj
-
-    GGUF:
-        blk.0.attn_q
-        blk.0.attn_k
-        blk.0.attn_v
-        blk.0.attn_output
-    """
-    m = re.match(
-        r"model\.layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$",
-        layer_name,
+def load_monarch_obj(pt_path: Path) -> tuple[str, torch.Tensor, torch.Tensor, torch.Tensor]:
+    obj = torch.load(pt_path, map_location="cpu", weights_only=True)
+    layer_name, left, right, permutation = extract_monarch_fields(
+        obj,
+        source=pt_path,
     )
 
-    if m is None:
-        return None
+    for tensor_name, tensor in (
+        ("L", left),
+        ("R", right),
+        ("perm", permutation),
+    ):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"{pt_path}: {tensor_name} must be a torch.Tensor, "
+                f"got {type(tensor).__name__}"
+            )
 
-    layer_id = int(m.group(1))
-    proj = m.group(2)
+    if not torch.is_floating_point(left):
+        raise TypeError(f"{pt_path}: L must use a floating dtype; got {left.dtype}")
+    if not torch.is_floating_point(right):
+        raise TypeError(f"{pt_path}: R must use a floating dtype; got {right.dtype}")
+    if permutation.dtype not in {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }:
+        raise TypeError(
+            f"{pt_path}: perm must use an integer dtype; got {permutation.dtype}"
+        )
 
-    proj_map = {
-        "q_proj": "attn_q",
-        "k_proj": "attn_k",
-        "v_proj": "attn_v",
-        "o_proj": "attn_output",
-    }
-
-    return f"blk.{layer_id}.{proj_map[proj]}"
+    return layer_name, left, right, permutation
 
 
 def load_all_monarch_tensors(monarch_dir: Path, dtype: str = "f32") -> list[tuple[str, np.ndarray]]:
@@ -132,6 +115,9 @@ def load_all_monarch_tensors(monarch_dir: Path, dtype: str = "f32") -> list[tupl
     We store L/R as F32 by default for debugging.
     perm is stored as int32.
     """
+    if dtype not in {"f16", "f32"}:
+        raise ValueError(f"Unsupported Monarch dtype: {dtype}")
+
     pt_files = list_monarch_pt_files(monarch_dir)
 
     if len(pt_files) == 0:
@@ -141,10 +127,10 @@ def load_all_monarch_tensors(monarch_dir: Path, dtype: str = "f32") -> list[tupl
 
     ok = 0
     skipped = 0
+    seen_bases: dict[str, Path] = {}
 
     for pt_path in pt_files:
-        obj = load_monarch_obj(pt_path)
-        layer_name = obj["layer_name"]
+        layer_name, L, R, perm = load_monarch_obj(pt_path)
 
         base = hf_layer_to_gguf_base(layer_name)
         if base is None:
@@ -152,26 +138,45 @@ def load_all_monarch_tensors(monarch_dir: Path, dtype: str = "f32") -> list[tupl
             logger.warning(f"[Monarch] Skip unsupported layer name: {layer_name}")
             continue
 
-        L = obj["L"].detach().cpu()
-        R = obj["R"].detach().cpu()
-        perm = obj["perm"].detach().cpu().to(torch.int32)
+        previous_path = seen_bases.get(base)
+        if previous_path is not None:
+            raise ValueError(
+                f"{pt_path}: duplicate Monarch layer {layer_name!r}; "
+                f"{base!r} was already provided by {previous_path}"
+            )
+        seen_bases[base] = pt_path
+
+        L = L.detach().cpu()
+        R = R.detach().cpu()
+        perm = perm.detach().cpu()
+
+        validate_monarch_arrays(
+            layer_name,
+            L.to(torch.float32).numpy(),
+            R.to(torch.float32).numpy(),
+            perm.numpy(),
+            source=pt_path,
+        )
 
         if dtype == "f16":
             L_np = L.to(torch.float16).numpy()
             R_np = R.to(torch.float16).numpy()
-        elif dtype == "f32":
+        else:
             L_np = L.to(torch.float32).numpy()
             R_np = R.to(torch.float32).numpy()
-        else:
-            raise ValueError(f"Unsupported Monarch dtype: {dtype}")
 
-        perm_np = perm.numpy().astype(np.int32)
+        perm_np = perm.numpy().astype(np.int32, copy=False)
 
         out.append((f"{base}.monarch_l", L_np))
         out.append((f"{base}.monarch_r", R_np))
         out.append((f"{base}.monarch_perm", perm_np))
 
         ok += 1
+
+    if ok == 0:
+        raise ValueError(
+            f"No supported Monarch attention layers found in: {monarch_dir}"
+        )
 
     logger.info(
         f"[Monarch] Loaded {ok} Monarch layers, skipped {skipped}, "
