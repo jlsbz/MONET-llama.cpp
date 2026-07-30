@@ -9,6 +9,8 @@
 > **证据口径说明：**本持续更新版使用“【代码确认】”“【材料记载】”“【综合归纳】”区分当前仓库中可直接核验的实现、正式材料中的陈述及跨材料归纳。论文中的实验结果属于投稿稿件报告结果，尚未在仓库中找到完整原始日志与复现实验包；两份专利材料均为技术交底书，不能据此认定已经申请或授权。
 >
 > **持续更新状态（Iteration I01，2026-07-30）：**已完成 Monarch 参数包字段、层名、shape、dtype、有限值、permutation 和重复映射校验，并以 12 个标准库单元测试完成本地验证。该结论只覆盖转换前输入校验，不代表真实模型转换、GGUF 加载、完整 runtime 或 Android 端测试已通过。详见[闭环台账](MONET_实现差距与验收闭环台账.md)、[迭代日志](MONET_开发迭代日志.md)和[验证记录](verification/iteration-I01.md)。
+>
+> **持续更新状态（Iteration I02，2026-07-30）：**已建立方阵 Monarch forward 的 NumPy 数值参考契约，明确执行顺序为 `blockdiag(R) → gather(perm) → blockdiag(L)`；直接分块计算与独立稠密矩阵物化路径完成交叉验证。完整 MONET Python 回归共 18 项通过，其中 I02 新增 6 项。该结论只覆盖数值语义基线，不代表 `llama.cpp` graph、自定义 GGML op/backend、真实模型或 Android 端已完成。详见[I02 验证记录](verification/iteration-I02.md)和代码提交 [`d013fe9`](https://github.com/jlsbz/MONET-llama.cpp/commit/d013fe9)。
 
 ## 一、项目概述
 
@@ -20,11 +22,11 @@
 >
 > | 类别 | 仓库内可核验产出 | 证据口径与说明 |
 > |---|---:|---|
-> | 核心研发代码 | 6 个可直接定位的 MONET 关键文件，另有 1 个专用测试文件 | 包括 1 个 PyTorch 拟合脚本、1 个 GGUF 转换脚本、1 个参数包校验模块，以及 3 个含明确 MONET 修改标记的 `llama.cpp` 模型声明/加载文件；不等同于“完整运行时已实现” |
+> | 核心研发代码 | 7 个可直接定位的 MONET 关键文件，另有 2 个专用测试文件 | 包括 1 个 PyTorch 拟合脚本、1 个 GGUF 转换脚本、1 个参数包校验模块、1 个 NumPy forward 参考模块，以及 3 个含明确 MONET 修改标记的 `llama.cpp` 模型声明/加载文件；不等同于“完整运行时已实现” |
 > | 科研论文 | 1 篇投稿稿件 | 截图显示论文已向 ATC '26 提交，稿件编号 #786，提交时间为 2026-06-11；未见录用或发表证明 |
 > | 专利材料 | 2 份技术交底书 | 均为技术交底阶段材料；未见申请号、受理通知或授权信息 |
 > | 项目技术文档 | 1 份中文项目说明手册、1 份方案思路阐述、1 份 README | 分别覆盖工程路线、方案演进和公开部署流程 |
-> | 本轮本地验证 | 12 个 Monarch 参数包校验单元测试全部通过 | 覆盖合法层名映射、兼容字段、shape/dtype/有限值与 permutation 失败路径；未使用真实 `.pt`、HF 权重或 Android 设备 |
+> | 本轮本地验证 | 18 个 MONET Python 单元测试全部通过 | I01 的 12 项覆盖参数包校验；I02 的 6 项覆盖 forward/dense 数值一致性、permutation 方向、shape/dtype 和失败路径；未使用真实 `.pt`、HF 权重或 Android 设备 |
 > | 图示与过程证据 | 11 张技术/实验/Demo 图片，另有 1 张论文投稿截图 | 部分图片可核验命令行和 App 端单次结果，但不能替代完整验收测试报告 |
 > | 端侧截图结果 | CPU/Termux 类截图：pp128 由 7.87 提升至 9.83 t/s，tg128 由 5.63 提升至 6.24 t/s；App 截图：Prefill 由 8.70 提升至 10.66 t/s，Decode 由 6.62 提升至 7.16 t/s | 按截图读数计算，分别约为 1.25×/1.11×和 1.23×/1.08×；设备型号、重复次数、温控和统计口径仍需补充 |
 > | 投稿论文报告结果 | 最高 2.42× Prefill、2.52× Decode；总内存流量示例由 210.84 MB/token 降至 118.8 MB/token | 属于论文报告结果；需用原始日志、脚本、模型哈希和设备信息完成验收级复核 |
@@ -61,11 +63,15 @@
 
        【代码确认】[`src/llama-model.h`](../llama.cpp-monarch/src/llama-model.h)新增 `llama_monarch_weight` 结构及 attention Q/K/V/O 四组字段；[`src/models/llama.cpp`](../llama.cpp-monarch/src/models/llama.cpp)按块大小 64 创建可选的 `monarch_l/r/perm` tensor，并在三类 tensor 同时存在时标记启用；[`src/llama-model.cpp`](../llama.cpp-monarch/src/llama-model.cpp)使用 `done_getting_tensors(true)` 允许额外 tensor。
 
-       【代码确认】在当前仓库中未检索到 `GGML_OP_MONARCH_LINEAR`、Monarch CPU/ARM kernel 或在 forward graph 中调用 Monarch tensor 的实现。因此，当前代码可确认到“参数拟合、GGUF 扩展、模型结构声明与 loader 认领/兼容”层面，不能仅凭现有源码认定“完整自定义算子、流式执行、块裁剪和端到端 Monarch runtime 均已提交到本仓库”。如完整实现位于其他分支、私有仓库或未提交目录，应在正式结项时补充。
+       【代码确认—Iteration I02】[`monarch_reference.py`](../llama.cpp-monarch/monarch_reference.py)增加方阵 Monarch 的 NumPy 直接 forward 与独立稠密物化两条路径，将拟合脚本中的行向量语义固定为 `R 块对角乘 → perm gather → L 块对角乘`。这为后续 C++/GGML 实现提供了非循环数值基线，但不是 runtime graph 实现。
+
+       【代码确认】在当前仓库中仍未检索到 `GGML_OP_MONARCH_LINEAR`、Monarch CPU/ARM kernel 或在 forward graph 中调用 Monarch tensor 的实现。因此，当前代码可确认到“参数拟合、GGUF 扩展、模型结构声明与 loader 认领/兼容、NumPy 数值参考”层面，不能仅凭现有源码认定“完整自定义算子、流式执行、块裁剪和端到端 Monarch runtime 均已提交到本仓库”。如完整实现位于其他分支、私有仓库或未提交目录，应在正式结项时补充。
 
     6. **测试与验证结果**
 
        【代码与测试确认—Iteration I01】[`test_monarch_tensor_validation.py`](../llama.cpp-monarch/tests/test_monarch_tensor_validation.py)新增 12 个单元测试，已在 Windows、Python 3.12.13、NumPy 2.3.5 环境全部通过；相关文件同时通过 Python 语法编译和 Git 差异格式检查。本轮环境未安装 PyTorch，也没有真实 Monarch `.pt` 参数包、HF 模型权重或 Android 设备，因此未执行真实 converter、GGUF reader、`llama.cpp` loader 或手机 benchmark。完整命令和边界见[验证记录](verification/iteration-I01.md)，代码提交为 [`c2769bc`](https://github.com/jlsbz/MONET-llama.cpp/commit/c2769bc)。
+
+       【代码与测试确认—Iteration I02】[`test_monarch_reference.py`](../llama.cpp-monarch/tests/test_monarch_reference.py)新增 6 个单元测试，验证直接分块 forward 与显式稠密矩阵结果一致、单块退化关系、permutation gather 方向、多维输入和最低 float32 计算，并覆盖错误宽度、非浮点与非有限输入。与 I01 测试合并运行时 18/18 通过，相关 Python 文件语法编译通过。完整命令和未执行项见[I02 验证记录](verification/iteration-I02.md)，代码提交为 [`d013fe9`](https://github.com/jlsbz/MONET-llama.cpp/commit/d013fe9)。
 
        【材料记载—截图可核验】[基线命令行截图](../docs/image-7.png)显示 Q4_K Medium 模型大小 3.80 GiB、pp128 为 7.87±0.27 t/s、tg128 为 5.63±0.20 t/s；[Monarch 命令行截图](../docs/image-8.png)显示模型大小 2.95 GiB、pp128 为 9.83±1.55 t/s、tg128 为 6.24±1.45 t/s。按截图读数，模型显示大小约下降 22.4%，pp128/tg128 分别约提升 24.9%/10.8%。截图未显示设备型号、运行次数、温控策略和完整命令，故应视为阶段性证据。
 
@@ -130,7 +136,7 @@
 | 技术问题与目标定义 | README、方案说明、两份交底书、投稿论文 | 已充分形成面向移动端带宽瓶颈的技术问题定义和算法—系统协同目标 | 与任务书原始目标逐条对齐 |
 | 算法原型 | PyTorch 拟合脚本；论文和手册中的 Monarch/块分解方案 | 方阵 attention projection 的激活感知拟合流程可从代码确认 | 训练/拟合输出、随机种子、误差汇总及可复现实验 |
 | 模型格式与加载 | GGUF extra tensor 转换、参数包校验单元测试、模型结构和 loader 认领代码 | 已完成调试型 extra tensor 路径、转换前输入校验和可选 tensor 加载框架；12 个校验测试本地通过 | 真实 `.pt` 到 GGUF 的端到端样例、reader dump、loader 日志和模型哈希 |
-| 完整推理运行时 | 文档和论文描述了自定义算子、流式执行和块裁剪 | 当前仓库源码不足以确认完整实现 | graph 接入、GGML op、CPU/ARM/GPU kernel、bitmap/调度代码及测试 |
+| 完整推理运行时 | 文档和论文描述了自定义算子、流式执行和块裁剪；I02 增加 NumPy forward/dense 数值基线 | 方阵 Monarch 数值语义已由 6 个测试本地确认；当前仓库仍不足以确认 graph/op/backend 完整实现 | graph 接入并消费 L/R/perm、GGML op、CPU/ARM/GPU kernel、bitmap/调度代码及测试 |
 | 端侧验证 | 命令行和 App 截图；论文结果表与图 | 已有阶段性 Demo 和论文级结果陈述 | 设备清单、完整命令、重复次数、温控、线程/频率、原始日志和第三方复核 |
 | 科研成果 | 1 篇投稿论文、2 份技术交底书 | 成果形态已形成 | 论文最新审稿状态；专利是否立案/申请/受理及对应编号 |
 | 项目管理与成本 | 仓库中未见任务书、合同、验收报告、会议纪要、成本台账 | 仅能提供技术结项初稿 | 正式验收和财务/人力材料 |
@@ -163,7 +169,7 @@
 | 1 | 明确识别移动端推理的内存带宽瓶颈，技术问题与硬件约束结合紧密 | 正式验收指标、任务书和项目管理材料未进入仓库，成果与合同目标无法逐条闭环 |
 | 2 | 技术路线能够根据部署反馈从 SVD 转向更规则的 Monarch/块分解 | 当前仓库未呈现论文所述完整 graph、算子和后端 kernel，代码证据链不完整 |
 | 3 | 同时沉淀论文、专利交底、说明手册、代码和 Demo 截图，成果类型较丰富 | 论文实验、截图实验和说明文档的数字口径未统一，部分“数倍加速/基本无损”表述需要更严格限定 |
-| 4 | PyTorch 拟合脚本和 GGUF extra tensor 转换路径职责清晰，便于分阶段调试；Iteration I01 已补充参数包校验和 12 个回归测试 | 自动化测试目前只覆盖转换前参数校验，仍缺真实 `.pt → GGUF → loader`、数值对齐、模型哈希、构建版本和端侧日志归档 |
+| 4 | PyTorch 拟合脚本和 GGUF extra tensor 转换路径职责清晰，便于分阶段调试；I01 已补充参数包校验，I02 已补充 NumPy forward/dense 数值基线，合计 18 个回归测试 | 自动化测试仍未覆盖真实 `.pt → GGUF → loader → graph`，也缺模型哈希、C++ 构建版本和端侧日志归档 |
 
 ## 改进措施/经验
 

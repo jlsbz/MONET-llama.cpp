@@ -3,6 +3,8 @@
 本清单只收录无法从当前仓库可靠确认、或现有材料相互不完全一致的信息。完成正式结项前，建议逐项填写“确认结果、证据链接、确认人、确认日期”。
 
 > **Iteration I01 更新（2026-07-30）：**已补充 Monarch 参数包静态校验和 12 个本地单元测试，因此“完全没有 MONET 专用测试”的原判断已更新为“转换前校验已有覆盖，真实 `.pt → GGUF → loader` 与端侧链路仍缺测试”。本轮没有降低端到端验收标准。
+>
+> **Iteration I02 更新（2026-07-30）：**已补充方阵 Monarch NumPy forward 与独立稠密物化对照，完整 MONET Python 测试集 18/18 通过；因此“数值语义没有可执行基线”已部分补齐。`llama.cpp` graph 尚未消费 L/R/perm，PyTorch/真实模型、GGML backend 和 Android 数值对齐仍待完成。
 
 ## 一、必须补充
 
@@ -158,6 +160,7 @@
 
 - [ ] **自动化测试（部分完成）**
   - [x] Iteration I01：层名映射、字段兼容、L/R shape/dtype/有限值、permutation 合法性的 12 个本地单元测试；证据见 [`test_monarch_tensor_validation.py`](../llama.cpp-monarch/tests/test_monarch_tensor_validation.py)、[验证记录](verification/iteration-I01.md)和提交 [`c2769bc`](https://github.com/jlsbz/MONET-llama.cpp/commit/c2769bc)。
+  - [x] Iteration I02：直接分块 forward、独立稠密物化、permutation gather 方向、多维输入及失败路径的 6 个本地单元测试；完整 MONET Python 测试集 18/18 通过。证据见 [`monarch_reference.py`](../llama.cpp-monarch/monarch_reference.py)、[`test_monarch_reference.py`](../llama.cpp-monarch/tests/test_monarch_reference.py)、[验证记录](verification/iteration-I02.md)和提交 [`d013fe9`](https://github.com/jlsbz/MONET-llama.cpp/commit/d013fe9)。
   - [ ] 使用真实 PyTorch `.pt` 参数包运行 converter，并核对 GGUF reader 中的 tensor 名称、数量、shape 和 dtype。
   - [ ] 使用可公开复现的模型执行 loader 回归、PyTorch/GGML 数值对齐和最小端到端推理。
   - [ ] 在目标 Android 设备执行命令行与 App 回归，归档构建、加载和 benchmark 日志。
