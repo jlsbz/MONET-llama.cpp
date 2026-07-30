@@ -88,6 +88,24 @@ def validate_monarch_arrays(
     if hf_layer_to_gguf_base(layer_name) is None:
         raise ValueError(f"{prefix}unsupported Monarch layer name: {layer_name}")
 
+    validate_monarch_structure(
+        left,
+        right,
+        permutation,
+        source=source,
+    )
+
+
+def validate_monarch_structure(
+    left: np.ndarray,
+    right: np.ndarray,
+    permutation: np.ndarray,
+    *,
+    source: str | Path | None = None,
+) -> int:
+    """Validate square Monarch factors and return their flattened width."""
+    prefix = _source_prefix(source)
+
     left = np.asarray(left)
     right = np.asarray(right)
     permutation = np.asarray(permutation)
@@ -142,3 +160,5 @@ def validate_monarch_arrays(
         raise ValueError(
             f"{prefix}perm must contain each index in [0, {expected_width}) exactly once"
         )
+
+    return expected_width
