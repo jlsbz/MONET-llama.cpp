@@ -60,6 +60,7 @@
   - 持续版材料映射表的 forward 数值参考、关键代码索引和 runtime 差异说明；
   - 持续版待补充清单的“自动化测试”项目；
   - 闭环台账新增 `MONET-GAP-013`，并更新 `MONET-GAP-004`、`MONET-GAP-007`。
+  - 补充 `MONET_结项汇报讲稿_持续更新版.md`，以结项报告控制验收口径，并结合中文手册和方案说明组织 12—15 分钟技术汇报与评审问答。
 - 已知限制：
   - 本轮实现是 NumPy reference，不是 `llama.cpp` graph 或 GGML backend；
   - 当前环境没有 PyTorch，未使用真实拟合参数做 PyTorch/NumPy 三方对照；
