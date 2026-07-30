@@ -67,9 +67,9 @@
   - `MONET-GAP-004` 仍要求 graph 明确消费 L/R/perm 并与本 reference 数值一致。
 - 待真实设备验证事项：Android 构建、真实模型加载、命令行/App 正确性、Prefill/Decode、内存、功耗和温升均未执行。
 - 代码提交：[`d013fe9`](https://github.com/jlsbz/MONET-llama.cpp/commit/d013fe9)
-- 文档提交：[待本轮文档提交后补记]
-- GitHub 同步：[待本轮推送后补记]
-- Pull Request：[待本轮 GitHub 同步后补记]
+- 文档提交：[`2c80121`](https://github.com/jlsbz/MONET-llama.cpp/commit/2c80121)
+- GitHub 同步：`codex/monet-completion` 已成功推送至 `origin`，远程提交为 `2c80121`。
+- Pull Request：未创建。已确认远程无该分支的现有 open PR；GitHub App 创建 Draft PR 返回 403 `Resource not accessible by integration`。可由有权限的登录会话打开 [main...codex/monet-completion compare 页面](https://github.com/jlsbz/MONET-llama.cpp/compare/main...codex/monet-completion?expand=1) 创建 Draft PR；不得强推或在仓库中保存访问令牌。
 - 下一轮建议：
   1. 以 `monarch_reference.py` 为 oracle，设计并实现只覆盖固定小矩阵的最小 C++/GGML graph 数值测试；
   2. 提供最小真实 `.pt` 参数包和可复现 HF 模型，闭环 `.pt → GGUF → reader`；
