@@ -53,62 +53,11 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
         create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
 
-
-        // changed !
         // Monarch extra tensors for attention projections.
-        {
-            const int64_t monarch_block_size = 64;
-
-            if (n_embd % monarch_block_size == 0) {
-                const int64_t monarch_num_blocks = n_embd / monarch_block_size;
-
-                auto create_monarch_weight = [&](llama_monarch_weight & mw, const char * base) {
-                    const std::string prefix = "blk." + std::to_string(i) + "." + std::string(base);
-
-                    const std::string name_l    = prefix + ".monarch_l";
-                    const std::string name_r    = prefix + ".monarch_r";
-                    const std::string name_perm = prefix + ".monarch_perm";
-
-                    mw.l = create_tensor(
-                        name_l,
-                        {monarch_block_size, monarch_block_size, monarch_num_blocks},
-                        TENSOR_NOT_REQUIRED
-                    );
-
-                    mw.r = create_tensor(
-                        name_r,
-                        {monarch_block_size, monarch_block_size, monarch_num_blocks},
-                        TENSOR_NOT_REQUIRED
-                    );
-
-                    mw.perm = create_tensor(
-                        name_perm,
-                        {n_embd},
-                        TENSOR_NOT_REQUIRED
-                    );
-
-                    mw.enabled = (mw.l != nullptr && mw.r != nullptr && mw.perm != nullptr);
-                    mw.block_size = (int32_t) monarch_block_size;
-                    mw.num_blocks = (int32_t) monarch_num_blocks;
-
-                    if (mw.enabled) {
-                        LLAMA_LOG_INFO(
-                            "monarch: layer %d %s enabled, block_size=%lld, num_blocks=%lld\n",
-                            i,
-                            base,
-                            (long long) monarch_block_size,
-                            (long long) monarch_num_blocks
-                        );
-                    }
-                };
-
-                create_monarch_weight(layer.wq_monarch, "attn_q");
-                create_monarch_weight(layer.wk_monarch, "attn_k");
-                create_monarch_weight(layer.wv_monarch, "attn_v");
-                create_monarch_weight(layer.wo_monarch, "attn_output");
-            }
-        }
-
+        create_tensor_monarch(layer.wq_monarch, i, LLM_TENSOR_ATTN_Q,   "attn_q",      layer.wq);
+        create_tensor_monarch(layer.wk_monarch, i, LLM_TENSOR_ATTN_K,   "attn_k",      layer.wk);
+        create_tensor_monarch(layer.wv_monarch, i, LLM_TENSOR_ATTN_V,   "attn_v",      layer.wv);
+        create_tensor_monarch(layer.wo_monarch, i, LLM_TENSOR_ATTN_OUT, "attn_output", layer.wo);
 
         // optional bias tensors
         layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
@@ -221,9 +170,20 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 cb(Qcur, "Qcur_normed", il);
                 cb(Kcur, "Kcur_normed", il);
             }
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            const auto & layer = model.layers[il];
+            if (layer.wo_monarch.enabled && layer.wo_s == nullptr && loras->empty()) {
+                cur = build_attn(inp_attn,
+                        nullptr, nullptr, nullptr,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                cur = build_monarch_mm(layer, layer.wo, cur, nullptr, 3);
+                if (layer.wo_b) {
+                    cur = ggml_add(ctx0, cur, layer.wo_b);
+                }
+            } else {
+                cur = build_attn(inp_attn,
+                        layer.wo, layer.wo_b, layer.wo_s,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            }
             cb(cur, "attn_out", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {

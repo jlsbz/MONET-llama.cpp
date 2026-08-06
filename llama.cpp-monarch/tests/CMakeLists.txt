@@ -243,6 +243,15 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+llama_build(test-monarch-op.cpp)
+target_include_directories(test-monarch-op PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-monarch-op LABEL "monarch")
+
+llama_build(test-monarch-model.cpp)
+# This integration test needs an explicit synthetic/model GGUF path.  Keep it
+# buildable by default, but do not register a guaranteed-to-fail no-argument
+# invocation in ctest.  See scripts/create_synthetic_monarch_gguf.py.
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

@@ -11,6 +11,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-monarch.h"
 
 #include <cassert>
 #include <cmath>
@@ -1086,6 +1087,34 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+ggml_tensor * llm_graph_context::build_monarch_mm(
+        const llama_layer & layer,
+              ggml_tensor * dense_weight,
+              ggml_tensor * cur,
+              ggml_tensor * weight_scale,
+                      int   projection) const {
+    const llama_monarch_weight * monarch = nullptr;
+    switch (projection) {
+        case 0: monarch = &layer.wq_monarch; break;
+        case 1: monarch = &layer.wk_monarch; break;
+        case 2: monarch = &layer.wv_monarch; break;
+        case 3: monarch = &layer.wo_monarch; break;
+        default: GGML_ABORT("invalid Monarch projection id: %d", projection);
+    }
+
+    // Scaled weights and LoRA adapters retain the upstream dense path until
+    // their interaction with fitted Monarch factors is explicitly validated.
+    if (!monarch->enabled || weight_scale != nullptr || !loras->empty()) {
+        return build_lora_mm(dense_weight, cur, weight_scale);
+    }
+
+    if (!ggml_is_contiguous(cur)) {
+        cur = ggml_cont(ctx0, cur);
+    }
+
+    return llama_monarch_linear(ctx0, cur, monarch->l, monarch->r, monarch->perm);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
@@ -1184,7 +1213,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             ggml_row_size(qkv->type, n_embd_q + n_embd_kv));
     } else {
         // separate Q/K/V path
-        Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
+        Qcur = build_monarch_mm(layer, layer.wq, cur, layer.wq_s, 0);
         cb(Qcur, "Qcur", il);
         if (layer.wq_b) {
             Qcur = ggml_add(ctx0, Qcur, layer.wq_b);
@@ -1194,7 +1223,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Qcur = ggml_clamp(ctx0, Qcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Qcur, "Qcur_clamped", il);
         }
-        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = build_monarch_mm(layer, layer.wk, cur, layer.wk_s, 1);
         cb(Kcur, "Kcur", il);
         if (layer.wk_b) {
             Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
@@ -1204,7 +1233,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Kcur = ggml_clamp(ctx0, Kcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Kcur, "Kcur_clamped", il);
         }
-        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = build_monarch_mm(layer, layer.wv, cur, layer.wv_s, 2);
         cb(Vcur, "Vcur", il);
         if (layer.wv_b) {
             Vcur = ggml_add(ctx0, Vcur, layer.wv_b);

@@ -8,9 +8,6 @@ import logging
 import os
 import sys
 from pathlib import Path
-import re
-import json
-from types import MethodType
 import numpy as np
 
 import torch
@@ -28,6 +25,13 @@ from conversion import (
     print_registered_models,
     _mistral_common_installed,
     _mistral_import_error_msg,
+)
+from monarch_tensor_validation import (
+    extract_monarch_fields,
+    hf_layer_to_gguf_base,
+    validate_monarch_arrays,
+    validate_monarch_layer_for_architecture,
+    validate_monarch_metadata,
 )
 
 
@@ -56,73 +60,73 @@ def safe_layer_filename(layer_name: str) -> str:
     return layer_name.replace(".", "__").replace("/", "_")
 
 
-def list_monarch_pt_files(monarch_dir: Path) -> list[Path]:
+def list_monarch_artifact_files(monarch_dir: Path) -> list[Path]:
     files: list[Path] = []
     for root, _, names in os.walk(monarch_dir):
         for name in names:
-            if name.endswith(".pt"):
+            if name.endswith((".pt", ".npz")):
                 files.append(Path(root) / name)
     return sorted(files)
 
 
-def load_monarch_obj(pt_path: Path) -> dict:
-    obj = torch.load(pt_path, map_location="cpu")
+def load_monarch_obj(artifact_path: Path) -> tuple[str, np.ndarray, np.ndarray, np.ndarray]:
+    if artifact_path.suffix == ".npz":
+        with np.load(artifact_path, allow_pickle=False) as archive:
+            obj = {name: archive[name] for name in archive.files}
+        if "layer_name" in obj:
+            obj["layer_name"] = str(np.asarray(obj["layer_name"]).item())
+    else:
+        obj = torch.load(artifact_path, map_location="cpu", weights_only=True)
 
-    if "layer_name" not in obj and "target_module_name" not in obj:
-        raise KeyError(
-            f"{pt_path} does not contain 'layer_name' or 'target_module_name'"
-        )
-
-    if "layer_name" not in obj:
-        obj["layer_name"] = obj["target_module_name"]
-
-    for k in ["L", "R", "perm"]:
-        if k not in obj:
-            raise KeyError(f"{pt_path} does not contain required key '{k}'")
-
-    return obj
-
-
-def hf_layer_to_gguf_base(layer_name: str) -> str | None:
-    """
-    Map HF LLaMA layer name to GGUF base tensor name.
-
-    HF:
-        model.layers.0.self_attn.q_proj
-        model.layers.0.self_attn.k_proj
-        model.layers.0.self_attn.v_proj
-        model.layers.0.self_attn.o_proj
-
-    GGUF:
-        blk.0.attn_q
-        blk.0.attn_k
-        blk.0.attn_v
-        blk.0.attn_output
-    """
-    m = re.match(
-        r"model\.layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$",
-        layer_name,
+    layer_name, left, right, permutation = extract_monarch_fields(
+        obj,
+        source=artifact_path,
     )
 
-    if m is None:
-        return None
+    if artifact_path.suffix == ".pt":
+        for tensor_name, tensor in (("L", left), ("R", right), ("perm", permutation)):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"{artifact_path}: {tensor_name} must be a torch.Tensor, "
+                    f"got {type(tensor).__name__}"
+                )
+        left = left.detach().cpu().numpy()
+        right = right.detach().cpu().numpy()
+        permutation = permutation.detach().cpu().numpy()
 
-    layer_id = int(m.group(1))
-    proj = m.group(2)
+    left_np = np.asarray(left)
+    right_np = np.asarray(right)
+    perm_np = np.asarray(permutation)
 
-    proj_map = {
-        "q_proj": "attn_q",
-        "k_proj": "attn_k",
-        "v_proj": "attn_v",
-        "o_proj": "attn_output",
-    }
+    validate_monarch_arrays(
+        layer_name, left_np, right_np, perm_np, source=artifact_path
+    )
+    num_blocks, block_size, _ = left_np.shape
+    width = num_blocks * block_size
+    validate_monarch_metadata(
+        obj,
+        width=width,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        source=artifact_path,
+    )
 
-    return f"blk.{layer_id}.{proj_map[proj]}"
+    if block_size != 64:
+        raise ValueError(
+            f"{artifact_path}: current llama.cpp loader requires block_size=64; "
+            f"got {block_size}"
+        )
+
+    return layer_name, left_np, right_np, perm_np
 
 
-def load_all_monarch_tensors(monarch_dir: Path, dtype: str = "f32") -> list[tuple[str, np.ndarray]]:
+def load_all_monarch_tensors(
+    monarch_dir: Path,
+    dtype: str = "f32",
+    model_architecture: str | None = None,
+) -> list[tuple[str, np.ndarray]]:
     """
-    Load all fitted Monarch .pt files and convert them to GGUF tensor entries.
+    Load all fitted Monarch .pt/.npz files and convert them to GGUF entries.
 
     Output tensor names:
         blk.i.attn_q.monarch_l
@@ -132,19 +136,29 @@ def load_all_monarch_tensors(monarch_dir: Path, dtype: str = "f32") -> list[tupl
     We store L/R as F32 by default for debugging.
     perm is stored as int32.
     """
-    pt_files = list_monarch_pt_files(monarch_dir)
+    if dtype not in {"f16", "f32"}:
+        raise ValueError(f"Unsupported Monarch dtype: {dtype}")
 
-    if len(pt_files) == 0:
-        raise FileNotFoundError(f"No .pt files found in Monarch dir: {monarch_dir}")
+    artifact_files = list_monarch_artifact_files(monarch_dir)
+
+    if len(artifact_files) == 0:
+        raise FileNotFoundError(f"No .pt or .npz files found in Monarch dir: {monarch_dir}")
 
     out: list[tuple[str, np.ndarray]] = []
 
     ok = 0
     skipped = 0
+    seen_bases: dict[str, Path] = {}
 
-    for pt_path in pt_files:
-        obj = load_monarch_obj(pt_path)
-        layer_name = obj["layer_name"]
+    for artifact_path in artifact_files:
+        layer_name, L, R, perm = load_monarch_obj(artifact_path)
+
+        if model_architecture is not None:
+            validate_monarch_layer_for_architecture(
+                layer_name,
+                model_architecture,
+                source=artifact_path,
+            )
 
         base = hf_layer_to_gguf_base(layer_name)
         if base is None:
@@ -152,26 +166,33 @@ def load_all_monarch_tensors(monarch_dir: Path, dtype: str = "f32") -> list[tupl
             logger.warning(f"[Monarch] Skip unsupported layer name: {layer_name}")
             continue
 
-        L = obj["L"].detach().cpu()
-        R = obj["R"].detach().cpu()
-        perm = obj["perm"].detach().cpu().to(torch.int32)
+        previous_path = seen_bases.get(base)
+        if previous_path is not None:
+            raise ValueError(
+                f"{artifact_path}: duplicate Monarch layer {layer_name!r}; "
+                f"{base!r} was already provided by {previous_path}"
+            )
+        seen_bases[base] = artifact_path
 
         if dtype == "f16":
-            L_np = L.to(torch.float16).numpy()
-            R_np = R.to(torch.float16).numpy()
-        elif dtype == "f32":
-            L_np = L.to(torch.float32).numpy()
-            R_np = R.to(torch.float32).numpy()
+            L_np = L.astype(np.float16, copy=False)
+            R_np = R.astype(np.float16, copy=False)
         else:
-            raise ValueError(f"Unsupported Monarch dtype: {dtype}")
+            L_np = L.astype(np.float32, copy=False)
+            R_np = R.astype(np.float32, copy=False)
 
-        perm_np = perm.numpy().astype(np.int32)
+        perm_np = perm.astype(np.int32, copy=False)
 
         out.append((f"{base}.monarch_l", L_np))
         out.append((f"{base}.monarch_r", R_np))
         out.append((f"{base}.monarch_perm", perm_np))
 
         ok += 1
+
+    if ok == 0:
+        raise ValueError(
+            f"No supported Monarch attention layers found in: {monarch_dir}"
+        )
 
     logger.info(
         f"[Monarch] Loaded {ok} Monarch layers, skipped {skipped}, "
@@ -202,8 +223,20 @@ def add_monarch_tensors_to_writer(model_instance, monarch_dir: Path, monarch_dty
 
     writer = model_instance.gguf_writer
 
+    model_arch = getattr(model_instance, "model_arch", None)
+    try:
+        model_architecture = gguf.MODEL_ARCH_NAMES[model_arch]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            f"cannot determine GGUF model architecture for Monarch tensors: {model_arch!r}"
+        ) from exc
+
     logger.info("[Monarch] Adding extra Monarch tensors to GGUF writer before model_instance.write()...")
-    extra_tensors = load_all_monarch_tensors(monarch_dir, dtype=monarch_dtype)
+    extra_tensors = load_all_monarch_tensors(
+        monarch_dir,
+        dtype=monarch_dtype,
+        model_architecture=model_architecture,
+    )
 
     for name, arr in extra_tensors:
         logger.info(f"[Monarch] Add tensor: {name}, shape={arr.shape}, dtype={arr.dtype}")
@@ -381,7 +414,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Directory containing fitted Monarch .pt files. "
+            "Directory containing fitted Monarch .pt or dependency-light .npz files. "
             "If set, the converter will keep the original dense tensors and additionally "
             "write Monarch tensors named *.monarch_l, *.monarch_r, *.monarch_perm."
         ),

@@ -37,6 +37,11 @@ void llama_model_qwen2::load_arch_tensors(llama_model_loader &) {
         create_tensor_qkv(layer, i, n_embd, n_embd, n_embd_gqa, n_embd_gqa, 0);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
 
+        // Qwen2.5-7B uses GQA: Q and O are square while K/V are rectangular.
+        // The current square Monarch format therefore only claims Q/O extras.
+        create_tensor_monarch(layer.wq_monarch, i, LLM_TENSOR_ATTN_Q,   "attn_q",      layer.wq);
+        create_tensor_monarch(layer.wo_monarch, i, LLM_TENSOR_ATTN_OUT, "attn_output", layer.wo);
+
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
@@ -98,9 +103,20 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            const auto & layer = model.layers[il];
+            if (layer.wo_monarch.enabled && layer.wo_s == nullptr && loras->empty()) {
+                cur = build_attn(inp_attn,
+                        nullptr, nullptr, nullptr,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+                cur = build_monarch_mm(layer, layer.wo, cur, nullptr, 3);
+                if (layer.wo_b) {
+                    cur = ggml_add(ctx0, cur, layer.wo_b);
+                }
+            } else {
+                cur = build_attn(inp_attn,
+                        layer.wo, layer.wo_b, layer.wo_s,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            }
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
