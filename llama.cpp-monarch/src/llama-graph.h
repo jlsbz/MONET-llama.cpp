@@ -848,6 +848,14 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
+    // projection: 0=q, 1=k, 2=v, 3=attention output
+    ggml_tensor * build_monarch_mm(
+        const llama_layer & layer,
+              ggml_tensor * dense_weight,
+              ggml_tensor * cur,
+              ggml_tensor * weight_scale,
+                      int   projection) const;
+
     // do mat_mul_id, while optionally apply lora
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as

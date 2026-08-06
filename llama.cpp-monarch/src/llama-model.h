@@ -220,7 +220,6 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_norm      = nullptr;
 };
 
-// changed !
 //   blk.i.attn_q.monarch_l
 //   blk.i.attn_q.monarch_r
 //   blk.i.attn_q.monarch_perm
@@ -231,8 +230,8 @@ struct llama_monarch_weight {
 
     bool enabled = false;
 
-    int32_t block_size = 64;
-    int32_t num_blocks = 64;
+    int32_t block_size = 0;
+    int32_t num_blocks = 0;
 };
 
 // change end !
@@ -286,7 +285,6 @@ struct llama_layer {
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
 
-    // changed !
     // Monarch tensors
     llama_monarch_weight wq_monarch;
     llama_monarch_weight wk_monarch;
@@ -708,6 +706,11 @@ struct llama_model_base : public llama_model {
     void create_tensor_qkv(llama_layer & layer, int bid,
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);
+
+    // helper: load an optional square Monarch L/R/perm triple for one dense projection
+    void create_tensor_monarch(llama_monarch_weight & monarch, int bid,
+                llm_tensor tensor, const char * base, ggml_tensor * dense_weight,
+                int64_t block_size = 64);
 
     void load_stats  (llama_model_loader & ml) override;
     void load_hparams(llama_model_loader & ml) override;

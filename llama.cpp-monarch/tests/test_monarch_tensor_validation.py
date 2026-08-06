@@ -16,6 +16,8 @@ from monarch_tensor_validation import (  # noqa: E402
     extract_monarch_fields,
     hf_layer_to_gguf_base,
     validate_monarch_arrays,
+    validate_monarch_layer_for_architecture,
+    validate_monarch_metadata,
 )
 
 
@@ -46,6 +48,37 @@ class TestMonarchLayerMapping(unittest.TestCase):
     def test_requires_a_string_layer_name(self) -> None:
         with self.assertRaisesRegex(TypeError, "must be a string"):
             hf_layer_to_gguf_base(0)  # type: ignore[arg-type]
+
+    def test_llama_accepts_all_attention_projections(self) -> None:
+        for projection in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            with self.subTest(projection=projection):
+                validate_monarch_layer_for_architecture(
+                    f"model.layers.0.self_attn.{projection}",
+                    "llama",
+                )
+
+    def test_qwen2_accepts_only_square_q_and_o(self) -> None:
+        for projection in ("q_proj", "o_proj"):
+            with self.subTest(projection=projection):
+                validate_monarch_layer_for_architecture(
+                    f"model.layers.0.self_attn.{projection}",
+                    "qwen2",
+                )
+
+        for projection in ("k_proj", "v_proj"):
+            with self.subTest(projection=projection):
+                with self.assertRaisesRegex(ValueError, "does not support"):
+                    validate_monarch_layer_for_architecture(
+                        f"model.layers.0.self_attn.{projection}",
+                        "qwen2",
+                    )
+
+    def test_rejects_architectures_without_runtime_support(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not enabled"):
+            validate_monarch_layer_for_architecture(
+                "model.layers.0.self_attn.q_proj",
+                "mistral",
+            )
 
 
 class TestMonarchObjectExtraction(unittest.TestCase):
@@ -203,6 +236,47 @@ class TestMonarchArrayValidation(unittest.TestCase):
                 self.right,
                 self.permutation,
                 source="fixture.pt",
+            )
+
+
+class TestMonarchMetadataValidation(unittest.TestCase):
+    def test_accepts_matching_or_absent_metadata(self) -> None:
+        validate_monarch_metadata(
+            {}, width=4096, block_size=64, num_blocks=64
+        )
+        validate_monarch_metadata(
+            {
+                "in_features": 4096,
+                "out_features": np.asarray(4096, dtype=np.int64),
+                "block_size": 64,
+                "num_blocks": 64,
+                "bias": None,
+            },
+            width=4096,
+            block_size=64,
+            num_blocks=64,
+        )
+
+    def test_rejects_inconsistent_dimensions(self) -> None:
+        for field, value, message in (
+            ("in_features", 2048, "in_features"),
+            ("out_features", 2048, "out_features"),
+            ("block_size", 32, "block_size"),
+            ("num_blocks", 32, "num_blocks"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_monarch_metadata(
+                        {field: value}, width=4096, block_size=64, num_blocks=64
+                    )
+
+    def test_rejects_fitted_bias(self) -> None:
+        with self.assertRaisesRegex(ValueError, "fitted bias"):
+            validate_monarch_metadata(
+                {"bias": np.zeros(8, dtype=np.float32)},
+                width=8,
+                block_size=4,
+                num_blocks=2,
             )
 
 

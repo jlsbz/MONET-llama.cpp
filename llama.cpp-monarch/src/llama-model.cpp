@@ -1450,9 +1450,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    // Changed ! should not be changed !
-    ml.done_getting_tensors(true);
-    // ml.done_getting_tensors();
+    // All MONET tensors must be claimed by the active architecture loader.
+    // Keeping this strict catches misspelled or unsupported extra tensors.
+    ml.done_getting_tensors();
 
     GGML_ASSERT(!(output && tok_embd &&
             strcmp(output->name, tok_embd->name) == 0 &&
@@ -2618,5 +2618,63 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED);
         layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
         layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
+    }
+}
+
+void llama_model_base::create_tensor_monarch(
+        llama_monarch_weight & monarch,
+                       int bid,
+                llm_tensor tensor,
+              const char * base,
+             ggml_tensor * dense_weight,
+                   int64_t block_size) {
+    // The current factor format and custom OP are square-only.  A missing
+    // dense tensor means this architecture selected a merged projection and
+    // therefore cannot consume a separate Monarch triple.
+    if (dense_weight == nullptr ||
+        block_size <= 0 ||
+        dense_weight->ne[0] != dense_weight->ne[1] ||
+        dense_weight->ne[0] % block_size != 0) {
+        return;
+    }
+
+    const int64_t width = dense_weight->ne[0];
+    const int64_t num_blocks = width / block_size;
+    const std::string prefix = "blk." + std::to_string(bid) + "." + std::string(base);
+
+    monarch.l = create_tensor(
+        tn(tensor, "monarch_l", bid),
+        {block_size, block_size, num_blocks},
+        TENSOR_NOT_REQUIRED
+    );
+    monarch.r = create_tensor(
+        tn(tensor, "monarch_r", bid),
+        {block_size, block_size, num_blocks},
+        TENSOR_NOT_REQUIRED
+    );
+    monarch.perm = create_tensor(
+        tn(tensor, "monarch_perm", bid),
+        {width},
+        TENSOR_NOT_REQUIRED
+    );
+
+    const int present = (monarch.l != nullptr) + (monarch.r != nullptr) + (monarch.perm != nullptr);
+    if (present != 0 && present != 3) {
+        throw std::runtime_error(
+            "incomplete Monarch tensor set for " + prefix +
+            ": expected .monarch_l, .monarch_r and .monarch_perm together");
+    }
+
+    if (present == 3) {
+        monarch.enabled = true;
+        monarch.block_size = (int32_t) block_size;
+        monarch.num_blocks = (int32_t) num_blocks;
+        LLAMA_LOG_INFO(
+            "monarch: layer %d %s enabled, block_size=%lld, num_blocks=%lld\n",
+            bid,
+            base,
+            (long long) block_size,
+            (long long) num_blocks
+        );
     }
 }
