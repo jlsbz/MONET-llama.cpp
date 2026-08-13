@@ -2,8 +2,11 @@ import os
 import json
 import math
 import argparse
+from pathlib import Path
+import random
 from typing import List, Dict, Tuple, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -216,6 +219,7 @@ def load_wikitext_texts(
     max_samples: int = 128,
     min_chars: int = 20,
     dataset_disk_path: Optional[str] = None,
+    dataset_cache_dir: Optional[str] = None,
 ) -> List[str]:
     """
     Load WikiText-2 texts.
@@ -224,8 +228,12 @@ def load_wikitext_texts(
     1. dataset_disk_path is None:
         load_dataset("wikitext", "wikitext-2-raw-v1")
 
-    2. dataset_disk_path is not None:
+    2. dataset_disk_path points to a datasets.save_to_disk() directory:
         load_from_disk(dataset_disk_path)
+
+    3. dataset_disk_path points to a directory containing split Parquet files
+       such as train-00000-of-00001.parquet:
+        load_dataset("parquet", data_files=..., split=split)
 
     If your WSL has no internet, you can download/save the dataset elsewhere:
         from datasets import load_dataset
@@ -237,14 +245,41 @@ def load_wikitext_texts(
 
     if dataset_disk_path is not None:
         print(f"[Dataset] Loading WikiText-2 from disk: {dataset_disk_path}")
-        ds = load_from_disk(dataset_disk_path)
-        if isinstance(ds, dict) or hasattr(ds, "keys"):
-            ds_split = ds[split]
+        local_path = Path(dataset_disk_path)
+        if not local_path.exists():
+            raise FileNotFoundError(f"dataset path does not exist: {local_path}")
+
+        if local_path.is_file():
+            if local_path.suffix.lower() != ".parquet":
+                raise ValueError(f"unsupported local dataset file: {local_path}")
+            parquet_files = [local_path]
         else:
-            ds_split = ds
+            parquet_files = sorted(local_path.glob(f"{split}-*.parquet"))
+
+        if parquet_files:
+            print("[Dataset] Local Parquet files:")
+            for parquet_file in parquet_files:
+                print(f"  {parquet_file}")
+            ds_split = load_dataset(
+                "parquet",
+                data_files={split: [str(path) for path in parquet_files]},
+                split=split,
+                cache_dir=dataset_cache_dir,
+            )
+        else:
+            ds = load_from_disk(str(local_path))
+            if isinstance(ds, dict) or hasattr(ds, "keys"):
+                ds_split = ds[split]
+            else:
+                ds_split = ds
     else:
         print("[Dataset] Loading WikiText-2 from HuggingFace datasets...")
-        ds_split = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+        ds_split = load_dataset(
+            "wikitext",
+            "wikitext-2-raw-v1",
+            split=split,
+            cache_dir=dataset_cache_dir,
+        )
 
     texts = []
     for item in ds_split:
@@ -379,12 +414,18 @@ def fit_one_monarch_layer(
         in_features=in_features,
         out_features=out_features,
         block_size=block_size,
-        bias=dense_layer.bias is not None,
+        # The original model bias remains in GGUF and is added by the runtime
+        # after the Monarch OP. Fit the weight transform only.
+        bias=False,
         dtype=torch.float32,
         init_std=init_std,
     ).to(device)
 
     dense_layer = dense_layer.to(device).eval()
+    # Keep the full model in its memory-saving dtype, but materialize one
+    # projection weight in F32 while fitting it. This avoids F16/F32 matmul
+    # mismatches without converting all 7B parameters to F32.
+    reference_weight = dense_layer.weight.detach().to(device=device, dtype=torch.float32)
 
     for p in dense_layer.parameters():
         p.requires_grad_(False)
@@ -407,7 +448,7 @@ def fit_one_monarch_layer(
         x = X_cpu[idx].to(device).float()
 
         with torch.no_grad():
-            y_ref = dense_layer(x).float()
+            y_ref = F.linear(x, reference_weight, bias=None).float()
 
         y_hat = monarch(x).float()
 
@@ -450,6 +491,7 @@ def fit_one_monarch_layer(
         X_cpu=X_cpu,
         device=device,
         batch_size=batch_size,
+        reference_weight=reference_weight,
     )
 
     eval_metrics["best_train_rel_mse"] = best_rel_mse
@@ -468,9 +510,12 @@ def evaluate_one_layer(
     X_cpu: torch.Tensor,
     device: str,
     batch_size: int,
+    reference_weight: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     dense_layer = dense_layer.to(device).eval()
     monarch_layer = monarch_layer.to(device).eval()
+    if reference_weight is None:
+        reference_weight = dense_layer.weight.detach().to(device=device, dtype=torch.float32)
 
     total_sq_error = 0.0
     total_sq_ref = 0.0
@@ -482,7 +527,7 @@ def evaluate_one_layer(
         end = min(start + batch_size, X_cpu.shape[0])
         x = X_cpu[start:end].to(device).float()
 
-        y_ref = dense_layer(x).float()
+        y_ref = F.linear(x, reference_weight, bias=None).float()
         y_hat = monarch_layer(x).float()
 
         diff = y_hat - y_ref
@@ -573,7 +618,16 @@ def main():
         "--dataset_disk_path",
         type=str,
         default=None,
-        help="Optional local dataset path saved by datasets.save_to_disk().",
+        help=(
+            "Optional local dataset path saved by datasets.save_to_disk(), "
+            "a split Parquet file, or a directory containing split-*.parquet files."
+        ),
+    )
+    parser.add_argument(
+        "--dataset_cache_dir",
+        type=str,
+        default=None,
+        help="Optional datasets cache directory; use a repo build directory for isolated runs.",
     )
     parser.add_argument(
         "--num_calib_samples",
@@ -665,6 +719,24 @@ def main():
         default=None,
         help="cuda or cpu. Default: auto.",
     )
+    parser.add_argument(
+        "--model_dtype",
+        type=str,
+        choices=["auto", "float16", "bfloat16", "float32"],
+        default="auto",
+        help="Model storage dtype. auto preserves the previous behavior: float16 on CUDA, float32 on CPU.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used for initialization and fit minibatch sampling.",
+    )
+    parser.add_argument(
+        "--allow_network",
+        action="store_true",
+        help="Allow Hugging Face network access. Local model runs are offline by default.",
+    )
 
     args = parser.parse_args()
 
@@ -673,18 +745,30 @@ def main():
     else:
         device = args.device
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    output_dir = Path(args.output_dir)
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(f"refusing to overwrite non-empty output directory: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     print(f"[Device] {device}")
     print(f"[Model] {args.model_path}")
     print(f"[Output] {args.output_dir}")
+    print(f"[Seed] {args.seed}")
 
     # ------------------------------------------------------------
     # Load tokenizer
     # ------------------------------------------------------------
 
     print("[Load] Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        use_fast=False,
+        local_files_only=not args.allow_network,
+    )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -694,13 +778,23 @@ def main():
     # ------------------------------------------------------------
 
     print("[Load] Loading model...")
-    dtype = torch.float16 if device == "cuda" else torch.float32
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    dtype = dtype_map.get(
+        args.model_dtype,
+        torch.float16 if device == "cuda" else torch.float32,
+    )
+    print(f"[Model dtype] {dtype}")
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=dtype,
         device_map=None,
         low_cpu_mem_usage=True,
+        local_files_only=not args.allow_network,
     )
 
     model = model.to(device)
@@ -769,6 +863,7 @@ def main():
         split=args.dataset_split,
         max_samples=args.num_calib_samples,
         dataset_disk_path=args.dataset_disk_path,
+        dataset_cache_dir=args.dataset_cache_dir,
     )
 
     token_batches = build_token_batches(
